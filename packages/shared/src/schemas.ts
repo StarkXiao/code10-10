@@ -168,42 +168,50 @@ export const photoUploadSchema = z.object({
   note: z.string().max(300).nullable().optional(),
 });
 
-export const damageCreateSchema = z
-  .object({
-    garmentId: z.string().min(1),
-    damageTypeId: z.string().min(1),
-    severity: z.enum(SEVERITIES),
-    partId: z.string().min(1).nullable().optional(),
-    detectedAt: notTooFarInFuture(),
-    detectedSource: z.enum(DETECTED_SOURCES).default('self'),
-    description: z.string().max(1000).nullable().optional(),
-    causeGuess: z.enum(CAUSE_GUESSES).nullable().optional(),
-    measurableSize: z
-      .object({ lengthMm: z.number().min(0).max(5000), widthMm: z.number().min(0).max(5000) })
-      .nullable()
-      .optional(),
-    annotationIds: z.array(z.string().min(1)).default([]),
-    locationUnknown: z.boolean().default(false),
-    locationNote: z.string().max(200).nullable().optional(),
-    scheduledAt: isoDate.nullable().optional(),
-    recurrenceOfId: z.string().min(1).nullable().optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (!value.locationUnknown && value.annotationIds.length === 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['annotationIds'],
-        message: '请在照片上标记破损位置，或勾选“位置不便标记”并说明',
-      });
-    }
-    if (value.locationUnknown && !value.locationNote) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['locationNote'],
-        message: '选择“位置不便标记”时必须说明原因',
-      });
-    }
-  });
+export const damageCreateBaseSchema = z.object({
+  garmentId: z.string().min(1),
+  damageTypeId: z.string().min(1),
+  severity: z.enum(SEVERITIES),
+  partId: z.string().min(1).nullable().optional(),
+  detectedAt: notTooFarInFuture(),
+  detectedSource: z.enum(DETECTED_SOURCES).default('self'),
+  description: z.string().max(1000).nullable().optional(),
+  causeGuess: z.enum(CAUSE_GUESSES).nullable().optional(),
+  measurableSize: z
+    .object({ lengthMm: z.number().min(0).max(5000), widthMm: z.number().min(0).max(5000) })
+    .nullable()
+    .optional(),
+  annotationIds: z.array(z.string().min(1)).default([]),
+  locationUnknown: z.boolean().default(false),
+  locationNote: z.string().max(200).nullable().optional(),
+  scheduledAt: isoDate.nullable().optional(),
+  recurrenceOfId: z.string().min(1).nullable().optional(),
+  /** 离线登记幂等键：断网时客户端生成，重放只建一条 */
+  clientOpId: z.string().min(1).max(64).nullable().optional(),
+});
+
+/** 破损位置规则：要么有照片标记，要么明确说明"位置不便标记" */
+export function damageLocationRule(
+  value: z.infer<typeof damageCreateBaseSchema>,
+  ctx: z.RefinementCtx,
+): void {
+  if (!value.locationUnknown && value.annotationIds.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['annotationIds'],
+      message: '请在照片上标记破损位置，或勾选“位置不便标记”并说明',
+    });
+  }
+  if (value.locationUnknown && !value.locationNote) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['locationNote'],
+      message: '选择“位置不便标记”时必须说明原因',
+    });
+  }
+}
+
+export const damageCreateSchema = damageCreateBaseSchema.superRefine(damageLocationRule);
 
 export const damageUpdateSchema = z.object({
   damageTypeId: z.string().min(1).optional(),
@@ -216,6 +224,8 @@ export const damageUpdateSchema = z.object({
     .object({ lengthMm: z.number().min(0).max(5000), widthMm: z.number().min(0).max(5000) })
     .nullable()
     .optional(),
+  /** 编辑前看到的版本号；与服务端不一致说明被其他端改过，按 409 冲突处理 */
+  expectedVersion: z.number().int().min(1).optional(),
 });
 
 export const damageScheduleSchema = z.object({
@@ -230,34 +240,39 @@ export const damageLinkRecurrenceSchema = z.object({
   recurrenceOfId: z.string().min(1),
 });
 
-export const repairCreateSchema = z
-  .object({
-    damageEventId: z.string().min(1),
-    executedBy: z.enum(EXECUTED_BY),
-    shopName: z.string().max(60).nullable().optional(),
-    shopCost: z.number().min(0).max(1_000_000).nullable().optional(),
-    stitchId: z.string().min(1),
-    stitchSecondaryIds: z.array(z.string().min(1)).default([]),
-    threadType: z.string().max(60).nullable().optional(),
-    threadColor: z.string().max(30).nullable().optional(),
-    durationMinutes: z.number().int().min(0).max(10_000).nullable().optional(),
-    cost: z.number().min(0).max(1_000_000).nullable().optional(),
-    startedAt: notTooFarInFuture(),
-    finishedAt: notTooFarInFuture(),
-    resultRating: z.enum(RESULT_RATINGS).nullable().optional(),
-    observationDays: z.number().int().min(1).max(365).nullable().optional(),
-    reuseOriginalFabric: z.boolean().default(false),
-    note: z.string().max(1000).nullable().optional(),
-  })
-  .superRefine((value, ctx) => {
-    if (value.finishedAt < value.startedAt) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['finishedAt'],
-        message: '完成日期不能早于开始日期',
-      });
-    }
-  });
+export const repairCreateBaseSchema = z.object({
+  damageEventId: z.string().min(1),
+  executedBy: z.enum(EXECUTED_BY),
+  shopName: z.string().max(60).nullable().optional(),
+  shopCost: z.number().min(0).max(1_000_000).nullable().optional(),
+  stitchId: z.string().min(1),
+  stitchSecondaryIds: z.array(z.string().min(1)).default([]),
+  threadType: z.string().max(60).nullable().optional(),
+  threadColor: z.string().max(30).nullable().optional(),
+  durationMinutes: z.number().int().min(0).max(10_000).nullable().optional(),
+  cost: z.number().min(0).max(1_000_000).nullable().optional(),
+  startedAt: notTooFarInFuture(),
+  finishedAt: notTooFarInFuture(),
+  resultRating: z.enum(RESULT_RATINGS).nullable().optional(),
+  observationDays: z.number().int().min(1).max(365).nullable().optional(),
+  reuseOriginalFabric: z.boolean().default(false),
+  note: z.string().max(1000).nullable().optional(),
+  /** 离线登记幂等键：断网时客户端生成，重放只建一条 */
+  clientOpId: z.string().min(1).max(64).nullable().optional(),
+});
+
+/** 修补起止日期规则：完成不能早于开始 */
+export function repairDateRule(value: z.infer<typeof repairCreateBaseSchema>, ctx: z.RefinementCtx): void {
+  if (value.finishedAt < value.startedAt) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['finishedAt'],
+      message: '完成日期不能早于开始日期',
+    });
+  }
+}
+
+export const repairCreateSchema = repairCreateBaseSchema.superRefine(repairDateRule);
 
 export const repairUpdateSchema = z.object({
   stitchId: z.string().min(1).optional(),
@@ -269,6 +284,8 @@ export const repairUpdateSchema = z.object({
   resultRating: z.enum(RESULT_RATINGS).nullable().optional(),
   observationDays: z.number().int().min(1).max(365).nullable().optional(),
   note: z.string().max(1000).nullable().optional(),
+  /** 编辑前看到的版本号；与服务端不一致说明被其他端改过，按 409 冲突处理 */
+  expectedVersion: z.number().int().min(1).optional(),
 });
 
 export const repairMaterialSchema = z.object({
@@ -333,6 +350,44 @@ export const wearLogSchema = z.object({
 
 export const wearLogBatchSchema = z.object({
   logs: z.array(wearLogSchema).min(1).max(200),
+});
+
+/**
+ * 离线队列批量同步：断网时各端把破损/修补/穿着登记先落本地，
+ * 联网后整批提交；服务端逐条处理并逐条回报（成功 / 幂等 / 业务拒绝 / 版本冲突）。
+ *
+ * clientOpId 由批量层统一注入为 opId（见 services 端组装），负载里不再单独传。
+ */
+export const offlineDamagePayloadSchema = damageCreateBaseSchema
+  .omit({ clientOpId: true })
+  .superRefine(damageLocationRule);
+
+export const offlineRepairPayloadSchema = repairCreateBaseSchema
+  .omit({ clientOpId: true })
+  .superRefine(repairDateRule);
+
+export const offlineSyncOpSchema = z.discriminatedUnion('kind', [
+  z.object({
+    opId: z.string().min(1).max(64),
+    kind: z.literal('wear-log'),
+    payload: wearLogSchema.omit({ clientOpId: true }),
+  }),
+  z.object({
+    opId: z.string().min(1).max(64),
+    kind: z.literal('damage-create'),
+    payload: offlineDamagePayloadSchema,
+  }),
+  z.object({
+    opId: z.string().min(1).max(64),
+    kind: z.literal('repair-create'),
+    payload: offlineRepairPayloadSchema,
+    /** 登记修补时本地看到的破损版本，用来发现"离线期间别的端已经改过这条破损" */
+    expectedDamageVersion: z.number().int().min(1).optional(),
+  }),
+]);
+
+export const offlineSyncSchema = z.object({
+  ops: z.array(offlineSyncOpSchema).min(1).max(100),
 });
 
 export const fabricSourceSchema = z.object({

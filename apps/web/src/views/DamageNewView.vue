@@ -15,7 +15,8 @@ import {
   type Severity,
 } from '@gml/shared';
 import { damageApi, garmentApi, photoApi, wardrobeApi } from '../api';
-import { messageOf } from '../api/client';
+import { ApiError, messageOf } from '../api/client';
+import { useOfflineQueueStore } from '../stores/offlineQueue';
 import PartPicker from '../components/PartPicker.vue';
 import PhotoAnnotator, { type DraftAnnotation } from '../components/PhotoAnnotator.vue';
 import type { DictionaryResponse, GarmentDetailResponse, PhotoAnnotationRow } from '../types';
@@ -23,6 +24,7 @@ import type { DictionaryResponse, GarmentDetailResponse, PhotoAnnotationRow } fr
 const route = useRoute();
 const router = useRouter();
 const queryClient = useQueryClient();
+const offline = useOfflineQueueStore();
 const garmentId = String(route.params.id);
 
 const step = ref(0);
@@ -111,6 +113,41 @@ async function commitGeometry(payload: { id: string }): Promise<void> {
   }
 }
 
+/** 把当前表单组装成离线队列负载（标记 ID 可能为空——离线时标注没传上去，用文字说明兜底） */
+function buildOfflinePayload(): Record<string, unknown> {
+  return {
+    garmentId,
+    damageTypeId: form.value.damageTypeId,
+    severity: form.value.severity,
+    partId: form.value.partId,
+    detectedAt: form.value.detectedAt,
+    detectedSource: form.value.detectedSource,
+    description: form.value.description || null,
+    causeGuess: form.value.causeGuess,
+    measurableSize:
+      form.value.lengthMm !== undefined || form.value.widthMm !== undefined
+        ? { lengthMm: form.value.lengthMm ?? 0, widthMm: form.value.widthMm ?? 0 }
+        : null,
+    annotationIds: savedAnnotationIds.value,
+    locationUnknown: form.value.locationUnknown,
+    locationNote: form.value.locationNote || null,
+    scheduledAt: form.value.scheduledAt || null,
+  };
+}
+
+function enqueueDamageAndLeave(): void {
+  const payload = buildOfflinePayload();
+  const damageTypeName = dict.value?.damageTypes.find((d) => d.id === form.value.damageTypeId)?.name ?? '破损';
+  offline.enqueue({
+    kind: 'damage-create',
+    payload,
+    summary: `${detail.value?.garment.name ?? '衣物'} · ${damageTypeName}（${form.value.detectedAt}）`,
+  });
+  ElMessage.warning('当前处于离线状态，破损登记已保存在本机，联网后会自动同步');
+  void queryClient.invalidateQueries({ queryKey: ['garment'] });
+  void router.push({ name: 'garment-detail', params: { id: garmentId } });
+}
+
 async function submit(): Promise<void> {
   if (!form.value.locationUnknown && savedAnnotationIds.value.length === 0 && drafts.value.length === 0) {
     ElMessage.warning('请在照片上标出破损位置，或勾选「位置不便标记」并说明原因');
@@ -123,45 +160,50 @@ async function submit(): Promise<void> {
   busy.value = true;
   try {
     if (drafts.value.length > 0 && photoId.value) {
-      const result = await photoApi.createAnnotations(
-        photoId.value,
-        drafts.value.map((draft) => ({
-          kind: draft.kind,
-          geometry: draft.geometry,
-          partId: form.value.partId,
-          label: null,
-        })),
-      );
-      savedAnnotationIds.value.push(...result.annotations.map((a) => a.id));
-      drafts.value = [];
+      try {
+        const result = await photoApi.createAnnotations(
+          photoId.value,
+          drafts.value.map((draft) => ({
+            kind: draft.kind,
+            geometry: draft.geometry,
+            partId: form.value.partId,
+            label: null,
+          })),
+        );
+        savedAnnotationIds.value.push(...result.annotations.map((a) => a.id));
+        drafts.value = [];
+      } catch (error) {
+        // 断网时标注传不上去：没有标记的破损不允许入库。
+        // 若用户已说明"位置不便标记"可以照常离线登记；否则引导他补一句文字说明，
+        // 而不是收下一条同步时必然被服务端拒绝的僵尸记录。
+        if (error instanceof ApiError && error.code === 'OFFLINE') {
+          if (!form.value.locationUnknown) {
+            ElMessage.warning('离线状态下无法上传照片标记，请勾选「位置不便标记」并用文字描述位置后再提交');
+            step.value = 1;
+            return;
+          }
+        } else {
+          throw error;
+        }
+      }
     }
 
-    const data = await damageApi.create({
-      garmentId,
-      damageTypeId: form.value.damageTypeId,
-      severity: form.value.severity,
-      partId: form.value.partId,
-      detectedAt: form.value.detectedAt,
-      detectedSource: form.value.detectedSource,
-      description: form.value.description || null,
-      causeGuess: form.value.causeGuess,
-      measurableSize:
-        form.value.lengthMm !== undefined || form.value.widthMm !== undefined
-          ? { lengthMm: form.value.lengthMm ?? 0, widthMm: form.value.widthMm ?? 0 }
-          : null,
-      annotationIds: savedAnnotationIds.value,
-      locationUnknown: form.value.locationUnknown,
-      locationNote: form.value.locationNote || null,
-      scheduledAt: form.value.scheduledAt || null,
-    });
-
-    ElMessage.success(`已登记 ${data.damage.code}`);
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ['garment'] }),
-      queryClient.invalidateQueries({ queryKey: ['garments'] }),
-      queryClient.invalidateQueries({ queryKey: ['wardrobe'] }),
-    ]);
-    await router.push({ name: 'damage-detail', params: { id: data.damage.id } });
+    try {
+      const data = await damageApi.create(buildOfflinePayload());
+      ElMessage.success(`已登记 ${data.damage.code}`);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['garment'] }),
+        queryClient.invalidateQueries({ queryKey: ['garments'] }),
+        queryClient.invalidateQueries({ queryKey: ['wardrobe'] }),
+      ]);
+      await router.push({ name: 'damage-detail', params: { id: data.damage.id } });
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'OFFLINE') {
+        enqueueDamageAndLeave();
+        return;
+      }
+      ElMessage.error(messageOf(error));
+    }
   } catch (error) {
     ElMessage.error(messageOf(error));
   } finally {

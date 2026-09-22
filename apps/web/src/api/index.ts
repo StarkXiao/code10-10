@@ -142,6 +142,34 @@ export const wearApi = {
   remove: (id: string) => api.del<{ deleted: boolean }>(`/wear-logs/${id}`),
 };
 
+/* ----------------------------- 离线同步 ----------------------------- */
+
+export type SyncOpKind = 'wear-log' | 'damage-create' | 'repair-create';
+
+export interface SyncOpResult {
+  opId: string;
+  kind: SyncOpKind;
+  status: 'ok' | 'duplicate' | 'rejected' | 'conflict';
+  entityType?: string;
+  entityId?: string;
+  code?: string;
+  version?: number;
+  errorCode?: string;
+  message?: string;
+  conflict?: unknown;
+}
+
+export const syncApi = {
+  batch: (ops: Array<Record<string, unknown>>) =>
+    api.post<{
+      results: SyncOpResult[];
+      synced: number;
+      duplicates: number;
+      rejected: number;
+      conflicts: number;
+    }>('/sync', { ops }),
+};
+
 /* ----------------------------- 布料库存 ----------------------------- */
 
 export const fabricApi = {

@@ -14,6 +14,7 @@ import { photoRouter } from './modules/photo.routes.js';
 import { damageRouter } from './modules/damage.routes.js';
 import { repairRouter } from './modules/repair.routes.js';
 import { wearRouter } from './modules/wear.routes.js';
+import { syncRouter } from './modules/sync.routes.js';
 import { fabricRouter } from './modules/fabric.routes.js';
 import { eventsRouter, reminderRouter, reminderRuleRouter } from './modules/reminder.routes.js';
 import { analyticsRouter } from './modules/analytics.routes.js';
@@ -82,6 +83,7 @@ export function createApp() {
   app.use('/api/damage-events', damageRouter);
   app.use('/api/repairs', repairRouter);
   app.use('/api/wear-logs', wearRouter);
+  app.use('/api/sync', syncRouter);
   app.use('/api/fabric-sources', fabricRouter);
   app.use('/api/reminders', reminderRouter);
   app.use('/api/reminder-rules', reminderRuleRouter);

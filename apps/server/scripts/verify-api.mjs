@@ -171,6 +171,26 @@ await call('/wear-logs/batch', {
   method: 'POST',
   body: { logs: [{ garmentId: garment.id, wornOn: daysAgo(5), clientOpId: 'verify-op-1' }] },
 });
+// 离线队列整批同步（幂等重放 + 逐条回报）
+const syncRes = await call('/sync', {
+  method: 'POST',
+  body: {
+    ops: [
+      { opId: 'verify-sync-wear', kind: 'wear-log', payload: { garmentId: garment.id, wornOn: daysAgo(4) } },
+      {
+        opId: 'verify-sync-wear',
+        kind: 'wear-log',
+        payload: { garmentId: garment.id, wornOn: daysAgo(4) },
+      },
+    ],
+  },
+  note: '离线批量同步：首条 ok、重放 duplicate',
+});
+if (syncRes.synced !== 1 || syncRes.duplicates !== 1) {
+  failures.push({ endpoint: 'POST /sync', status: 200, message: `期望 synced=1/duplicates=1，实际 ${syncRes.synced}/${syncRes.duplicates}` });
+} else {
+  passed.push('POST /sync · 离线批量同步与幂等重放');
+}
 await call('/reminder-rules/run-now', { method: 'POST', note: '手动扫描提醒' });
 
 const shareLink = await call('/share-links', {

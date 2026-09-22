@@ -92,7 +92,11 @@ async function wearToday(): Promise<void> {
   } catch (error) {
     // 只有断网才入队；其他错误（比如衣物已退役）必须如实提示
     if (error instanceof ApiError && error.code === 'OFFLINE') {
-      offline.enqueue({ garmentId, wornOn: today, session: 'full_day' });
+      offline.enqueue({
+        kind: 'wear-log',
+        payload: { garmentId, wornOn: today, session: 'full_day' },
+        summary: `${garment.value?.name ?? '这件衣物'} · ${today} 穿着打点`,
+      });
       ElMessage.warning('暂时没连上服务器，已放入离线队列，联网后自动同步');
     } else {
       ElMessage.error(messageOf(error));

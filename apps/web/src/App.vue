@@ -8,11 +8,13 @@ import { getToken } from './api/client';
 import { useSessionStore } from './stores/session';
 import { useOfflineQueueStore } from './stores/offlineQueue';
 import { useOfflineSync } from './composables/useOfflineSync';
+import SyncIssuesCenter from './components/SyncIssuesCenter.vue';
 
 const route = useRoute();
 const router = useRouter();
 const session = useSessionStore();
 const offline = useOfflineQueueStore();
+const syncCenter = ref<InstanceType<typeof SyncIssuesCenter> | null>(null);
 const badge = ref(0);
 let source: EventSource | null = null;
 let badgeTimer: number | undefined;
@@ -112,8 +114,24 @@ function logout(): void {
         <el-menu-item index="analytics" @click="router.push({ name: 'analytics' })">长期使用</el-menu-item>
         <el-menu-item index="settings" @click="router.push({ name: 'settings' })">设置</el-menu-item>
       </el-menu>
-      <el-tag v-if="offline.queue.length > 0" type="warning" size="small">
+      <el-tag
+        v-if="offline.queue.length > 0"
+        type="warning"
+        size="small"
+        style="cursor: pointer"
+        @click="syncCenter?.open()"
+      >
         离线待同步 {{ offline.queue.length }}
+      </el-tag>
+      <el-tag
+        v-if="offline.issues.length > 0"
+        :type="offline.conflictCount > 0 ? 'danger' : 'info'"
+        size="small"
+        effect="dark"
+        style="cursor: pointer"
+        @click="syncCenter?.open()"
+      >
+        同步{{ offline.conflictCount > 0 ? '冲突' : '问题' }} {{ offline.issues.length }}
       </el-tag>
       <el-dropdown v-if="session.user">
         <span style="cursor: pointer; display: inline-flex; align-items: center; gap: 2px">
@@ -131,5 +149,6 @@ function logout(): void {
     <el-main style="padding: 0">
       <router-view />
     </el-main>
+    <SyncIssuesCenter ref="syncCenter" />
   </el-container>
 </template>

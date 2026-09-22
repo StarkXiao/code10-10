@@ -166,6 +166,8 @@ export interface RepairRow {
   resultRating: string | null;
   note: string | null;
   reuseOriginalFabric: boolean;
+  /** 记录版本：每次修改 +1，多端并发按它检测冲突 */
+  version: number;
   stitch: { id: string; name: string; code: string };
   change: RepairChange | null;
   reviews: ReviewResultRow[];
@@ -200,6 +202,8 @@ export interface DamageRow {
   recurrenceIndex: number | null;
   locationUnknown: boolean;
   locationNote: string | null;
+  /** 记录版本：每次修改 +1，多端并发按它检测冲突 */
+  version: number;
   damageType: { id: string; code: string; name: string };
   part?: { id: string; name: string } | null;
   repairs: RepairRow[];

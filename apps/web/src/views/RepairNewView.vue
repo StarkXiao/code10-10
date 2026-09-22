@@ -26,13 +26,15 @@ import {
   type Visibility,
 } from '@gml/shared';
 import { damageApi, fabricApi, photoApi, repairApi, wardrobeApi } from '../api';
-import { messageOf } from '../api/client';
+import { ApiError, messageOf } from '../api/client';
+import { useOfflineQueueStore } from '../stores/offlineQueue';
 import PhotoUploader from '../components/PhotoUploader.vue';
 import type { DamageDetail, DictionaryResponse, FabricSourceItem, GarmentPhotoRow } from '../types';
 
 const route = useRoute();
 const router = useRouter();
 const queryClient = useQueryClient();
+const offline = useOfflineQueueStore();
 const damageId = String(route.params.id);
 
 const step = ref(0);
@@ -98,32 +100,59 @@ onMounted(async () => {
   }
 });
 
+function buildRepairPayload(): Record<string, unknown> {
+  return {
+    damageEventId: damageId,
+    executedBy: form.value.executedBy,
+    shopName: form.value.shopName || null,
+    shopCost: form.value.shopCost ?? null,
+    stitchId: form.value.stitchId,
+    stitchSecondaryIds: form.value.secondaryIds,
+    threadType: form.value.threadType || null,
+    threadColor: form.value.threadColor || null,
+    durationMinutes: form.value.durationMinutes ?? null,
+    cost: form.value.cost ?? null,
+    startedAt: form.value.startedAt,
+    finishedAt: form.value.finishedAt,
+    resultRating: form.value.resultRating,
+    observationDays: form.value.observationDays ?? null,
+    reuseOriginalFabric: form.value.reuseOriginalFabric,
+    note: form.value.note || null,
+  };
+}
+
 async function createRepair(): Promise<void> {
   if (!damage.value) return;
   busy.value = true;
   try {
-    const data = await repairApi.create({
-      damageEventId: damageId,
-      executedBy: form.value.executedBy,
-      shopName: form.value.shopName || null,
-      shopCost: form.value.shopCost ?? null,
-      stitchId: form.value.stitchId,
-      stitchSecondaryIds: form.value.secondaryIds,
-      threadType: form.value.threadType || null,
-      threadColor: form.value.threadColor || null,
-      durationMinutes: form.value.durationMinutes ?? null,
-      cost: form.value.cost ?? null,
-      startedAt: form.value.startedAt,
-      finishedAt: form.value.finishedAt,
-      resultRating: form.value.resultRating,
-      observationDays: form.value.observationDays ?? null,
-      reuseOriginalFabric: form.value.reuseOriginalFabric,
-      note: form.value.note || null,
-    });
+    const data = await repairApi.create(buildRepairPayload());
     repairId.value = data.repair.id;
     ElMessage.success(`已登记第 ${data.repair.round} 轮修补`);
     step.value = 1;
   } catch (error) {
+    if (error instanceof ApiError && error.code === 'OFFLINE') {
+      // 离线：第 1 轮修补先入队；记录本地破损版本，同步时若别的端已改过会回报冲突。
+      // 多轮修补（返工）离线时无法知道自己是第几轮，提示用户联网后再登记，避免抢错轮次。
+      const hasRepairs = (damage.value.repairs?.length ?? 0) > 0;
+      if (hasRepairs) {
+        ElMessage.warning('离线状态下登记返工修补可能与其他端的轮次冲突，请联网后再登记');
+        return;
+      }
+      const stitchName = dict.value?.stitches.find((s) => s.id === form.value.stitchId)?.name ?? '修补';
+      offline.enqueue({
+        kind: 'repair-create',
+        payload: buildRepairPayload(),
+        baseDamageVersion: damage.value.version,
+        summary: `${damage.value.garment.name} · ${damage.value.code} · ${stitchName}`,
+      });
+      ElMessage.warning('当前处于离线状态，修补登记已保存在本机，联网后会自动同步（后续用料与变化请在同步完成后补录）');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['garment'] }),
+        queryClient.invalidateQueries({ queryKey: ['garments'] }),
+      ]);
+      void router.push({ name: 'damage-detail', params: { id: damageId } });
+      return;
+    }
     ElMessage.error(messageOf(error));
   } finally {
     busy.value = false;

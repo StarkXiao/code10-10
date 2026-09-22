@@ -161,7 +161,7 @@ wearRouter.delete(
   }),
 );
 
-async function recordWear(
+export async function recordWear(
   wardrobeId: string,
   userId: string,
   body: z.infer<typeof wearLogSchema>,

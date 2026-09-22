@@ -13,6 +13,7 @@ import {
   type DamageStatus,
 } from '@gml/shared';
 import { HttpError } from '../lib/errors.js';
+import type { Prisma } from '@prisma/client';
 import { created, handler, ok, parseBody, parseQuery } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { logActivity } from '../lib/activity.js';
@@ -96,88 +97,19 @@ repairRouter.post(
   '/',
   handler(async (req, res) => {
     const body = parseBody(repairCreateSchema, req.body);
-    const damage = await prisma.damageEvent.findFirst({
-      where: { id: body.damageEventId, garment: { wardrobeId: req.ctx.wardrobeId, deletedAt: null } },
-      include: { garment: true, damageType: true },
-    });
-    if (!damage) throw new HttpError('NOT_FOUND', '破损事件不存在');
-    if (DAMAGE_TERMINAL_STATUSES.includes(damage.status as DamageStatus)) {
-      throw new HttpError('DAMAGE_ALREADY_RESOLVED', '这个破损事件已经终结，请先重新打开或新建一条破损记录');
-    }
-    if (damage.garment.status === 'retired') throw new HttpError('GARMENT_RETIRED', '衣物已退役，无法登记修补');
-
-    const stitch = await prisma.stitch.findUnique({ where: { id: body.stitchId } });
-    if (!stitch) throw new HttpError('NOT_FOUND', '针法不存在');
-
-    const careRule = await prisma.careRule.findUnique({ where: { materialCode: damage.garment.materialPrimary } });
-    const isSelf = body.executedBy === 'self' || body.executedBy === 'family';
-    const defaultDays = isSelf
-      ? careRule?.observationDaysSelf ?? 14
-      : careRule?.observationDaysShop ?? 7;
-    const observationDays = body.observationDays ?? defaultDays;
-    const finishedAt = parseDateOnly(body.finishedAt);
-    const observationUntil = addDays(finishedAt, observationDays);
-
-    // 轮次是「查最大轮次 +1」：并发返工会撞车（damageEventId + round 唯一），撞了就重算
-    const repair = await withUniqueRetry(async () => {
-      const existing = await prisma.repair.findMany({
-        where: { damageEventId: damage.id },
-        orderBy: { round: 'desc' },
-        take: 1,
-      });
-      const round = (existing[0]?.round ?? 0) + 1;
-      return prisma.$transaction(async (tx) => {
-        const record = await tx.repair.create({
-          data: {
-            damageEventId: damage.id,
-            round,
-          executedBy: body.executedBy,
-          shopName: body.shopName ?? null,
-          shopCost: body.shopCost ?? null,
-          stitchId: body.stitchId,
-          stitchSecondaryIds: (body.stitchSecondaryIds ?? []) as never,
-          threadType: body.threadType ?? null,
-          threadColor: body.threadColor ?? null,
-          durationMinutes: body.durationMinutes ?? null,
-          cost: body.cost ?? null,
-          startedAt: parseDateOnly(body.startedAt),
-          finishedAt,
-          resultRating: body.resultRating ?? null,
-          observationDays,
-          observationUntil,
-          status: 'done',
-          reuseOriginalFabric: body.reuseOriginalFabric,
-          note: body.note ?? null,
-          createdBy: req.ctx.userId,
-          },
-        });
-        await tx.damageEvent.update({ where: { id: damage.id }, data: { status: 'repaired' } });
-        // 上一轮的待办（返工提醒等）到此闭环
-        await tx.reminder.updateMany({
-          where: { subjectType: 'damage_event', subjectId: damage.id, status: { in: ['pending', 'notified'] } },
-          data: {
-            status: 'done',
-            handledAt: new Date(),
-            resultRef: { newRepairId: record.id, round } as never,
-          },
-        });
-        return record;
-      });
-    });
-
-    await syncGarmentStatus(damage.garmentId);
-    await logActivity({
+    const { repair, duplicate } = await createRepair({
       wardrobeId: req.ctx.wardrobeId,
-      actorId: req.ctx.userId,
-      entityType: 'repair',
-      entityId: repair.id,
-      action: 'create',
-      diff: { damageEventId: damage.id, round: repair.round, stitch: stitch.name, observationDays },
+      userId: req.ctx.userId,
+      body,
       requestId: req.ctx.requestId,
     });
-
+    if (duplicate) {
+      ok(req, res, { repair, duplicate, nextStep: '已存在相同的离线操作，本次为幂等返回' }, { idempotent: true });
+      return;
+    }
     created(req, res, {
       repair,
+      duplicate,
       nextStep: '请补全「修补后变化」并上传前后对比照片，然后开始观察期。',
     });
   }),
@@ -221,10 +153,33 @@ repairRouter.patch(
       throw new HttpError('CONFLICT', '已闭环的修补记录不能再修改，如需更正请追加备注');
     }
     const body = parseBody(repairUpdateSchema, req.body);
+    if (body.expectedVersion !== undefined && body.expectedVersion !== repair.version) {
+      throw new HttpError(
+        'VERSION_CONFLICT',
+        `这条修补在你编辑期间已被其他端修改（你的版本 v${body.expectedVersion}，当前版本 v${repair.version}），请刷新后合并修改`,
+        {
+          entityType: 'repair',
+          entityId: repair.id,
+          expectedVersion: body.expectedVersion,
+          currentVersion: repair.version,
+          current: {
+            stitchId: repair.stitchId,
+            threadType: repair.threadType,
+            threadColor: repair.threadColor,
+            durationMinutes: repair.durationMinutes,
+            cost: repair.cost,
+            resultRating: repair.resultRating,
+            note: repair.note,
+            observationDays: repair.observationDays,
+          },
+        },
+      );
+    }
     const observationDays = body.observationDays ?? repair.observationDays;
     const updated = await prisma.repair.update({
       where: { id: repair.id },
       data: {
+        version: { increment: 1 },
         ...(body.stitchId ? { stitchId: body.stitchId } : {}),
         ...(body.stitchSecondaryIds ? { stitchSecondaryIds: body.stitchSecondaryIds as never } : {}),
         ...(body.threadType !== undefined ? { threadType: body.threadType } : {}),
@@ -407,9 +362,12 @@ repairRouter.post(
     const updated = await prisma.$transaction(async (tx) => {
       const record = await tx.repair.update({
         where: { id: repair.id },
-        data: { status: 'observing', observationDays, observationUntil },
+        data: { version: { increment: 1 }, status: 'observing', observationDays, observationUntil },
       });
-      await tx.damageEvent.update({ where: { id: repair.damageEventId }, data: { status: 'observing' } });
+      await tx.damageEvent.update({
+        where: { id: repair.damageEventId },
+        data: { version: { increment: 1 }, status: 'observing' },
+      });
       return record;
     });
     await syncGarmentStatus(damage.garmentId);
@@ -551,6 +509,131 @@ repairRouter.post(
     ok(req, res, { url: `${url}?token=${encodeURIComponent(extractToken(req))}` });
   }),
 );
+
+export interface CreateRepairContext {
+  wardrobeId: string;
+  userId: string;
+  body: z.infer<typeof repairCreateSchema>;
+  requestId?: string;
+  /** 离线同步时携带：本地提交时看到的破损版本，落后则报版本冲突 */
+  expectedDamageVersion?: number;
+}
+
+/**
+ * 登记修补（在线路由与离线同步端点共用一份逻辑）。
+ * 幂等：同一 clientOpId 重放直接返回已建记录。
+ */
+export async function createRepair(ctx: CreateRepairContext): Promise<{
+  repair: Prisma.RepairGetPayload<Record<string, never>>;
+  duplicate: boolean;
+}> {
+  const { wardrobeId, userId, body } = ctx;
+  const damage = await prisma.damageEvent.findFirst({
+    where: { id: body.damageEventId, garment: { wardrobeId, deletedAt: null } },
+    include: { garment: true, damageType: true },
+  });
+  if (!damage) throw new HttpError('NOT_FOUND', '破损事件不存在');
+  if (DAMAGE_TERMINAL_STATUSES.includes(damage.status as DamageStatus)) {
+    throw new HttpError('DAMAGE_ALREADY_RESOLVED', '这个破损事件已经终结，请先重新打开或新建一条破损记录');
+  }
+  if (damage.garment.status === 'retired') throw new HttpError('GARMENT_RETIRED', '衣物已退役，无法登记修补');
+  // 离线期间这条破损在别的端被改过：不能静默覆盖，交给用户合并后再提交
+  if (ctx.expectedDamageVersion !== undefined && ctx.expectedDamageVersion !== damage.version) {
+    throw new HttpError(
+      'VERSION_CONFLICT',
+      `你离线期间这条破损已被其他端更新（你的版本 v${ctx.expectedDamageVersion}，当前版本 v${damage.version}），请查看最新记录后再提交修补`,
+      {
+        entityType: 'damage_event',
+        entityId: damage.id,
+        code: damage.code,
+        expectedVersion: ctx.expectedDamageVersion,
+        currentVersion: damage.version,
+      },
+    );
+  }
+
+  // 离线重放 / 多端重复提交：同 clientOpId 直接返回首建记录
+  if (body.clientOpId) {
+    const byOp = await prisma.repair.findUnique({ where: { clientOpId: body.clientOpId } });
+    if (byOp) return { repair: byOp, duplicate: true };
+  }
+
+  const stitch = await prisma.stitch.findUnique({ where: { id: body.stitchId } });
+  if (!stitch) throw new HttpError('NOT_FOUND', '针法不存在');
+
+  const careRule = await prisma.careRule.findUnique({ where: { materialCode: damage.garment.materialPrimary } });
+  const isSelf = body.executedBy === 'self' || body.executedBy === 'family';
+  const defaultDays = isSelf
+    ? careRule?.observationDaysSelf ?? 14
+    : careRule?.observationDaysShop ?? 7;
+  const observationDays = body.observationDays ?? defaultDays;
+  const finishedAt = parseDateOnly(body.finishedAt);
+  const observationUntil = addDays(finishedAt, observationDays);
+
+  // 轮次是「查最大轮次 +1」：并发返工会撞车（damageEventId + round 唯一），撞了就重算
+  const repair = await withUniqueRetry(async () => {
+    const existing = await prisma.repair.findMany({
+      where: { damageEventId: damage.id },
+      orderBy: { round: 'desc' },
+      take: 1,
+    });
+    const round = (existing[0]?.round ?? 0) + 1;
+    return prisma.$transaction(async (tx) => {
+      const record = await tx.repair.create({
+        data: {
+          damageEventId: damage.id,
+          round,
+          executedBy: body.executedBy,
+          shopName: body.shopName ?? null,
+          shopCost: body.shopCost ?? null,
+          stitchId: body.stitchId,
+          stitchSecondaryIds: (body.stitchSecondaryIds ?? []) as never,
+          threadType: body.threadType ?? null,
+          threadColor: body.threadColor ?? null,
+          durationMinutes: body.durationMinutes ?? null,
+          cost: body.cost ?? null,
+          startedAt: parseDateOnly(body.startedAt),
+          finishedAt,
+          resultRating: body.resultRating ?? null,
+          observationDays,
+          observationUntil,
+          status: 'done',
+          reuseOriginalFabric: body.reuseOriginalFabric,
+          note: body.note ?? null,
+          clientOpId: body.clientOpId ?? null,
+          createdBy: userId,
+        },
+      });
+      await tx.damageEvent.update({
+        where: { id: damage.id },
+        data: { version: { increment: 1 }, status: 'repaired' },
+      });
+      // 上一轮的待办（返工提醒等）到此闭环
+      await tx.reminder.updateMany({
+        where: { subjectType: 'damage_event', subjectId: damage.id, status: { in: ['pending', 'notified'] } },
+        data: {
+          status: 'done',
+          handledAt: new Date(),
+          resultRef: { newRepairId: record.id, round } as never,
+        },
+      });
+      return record;
+    });
+  });
+
+  await syncGarmentStatus(damage.garmentId);
+  await logActivity({
+    wardrobeId,
+    actorId: userId,
+    entityType: 'repair',
+    entityId: repair.id,
+    action: 'create',
+    diff: { damageEventId: damage.id, round: repair.round, stitch: stitch.name, observationDays, offline: !!body.clientOpId },
+    requestId: ctx.requestId,
+  });
+
+  return { repair, duplicate: false };
+}
 
 async function findRepairOrThrow(id: string, wardrobeId: string) {
   const repair = await prisma.repair.findFirst({

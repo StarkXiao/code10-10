@@ -299,7 +299,7 @@ test.describe('衣物修补日志 · 主链路', () => {
 
     await context.setOffline(true);
     await page.getByRole('button', { name: '今天穿了' }).click();
-    await expect(page.getByText(/离线队列/u).first()).toBeVisible();
+    await expect(page.getByText(/离线队列|离线状态/u).first()).toBeVisible();
     await expect(page.getByText(/离线待同步/u).first()).toBeVisible();
 
     await context.setOffline(false);
@@ -310,5 +310,114 @@ test.describe('衣物修补日志 · 主链路', () => {
     await page.reload();
     await expect(page.getByText('穿着次数').first()).toBeVisible();
     await expect(page.locator('body')).toContainText('1 次');
+  });
+
+  test('断网登记破损：先落本机，联网后同步入库', async ({ page, context }) => {
+    await register(page, uniqueEmail());
+    const garmentId = await createGarment(page, '离线破损衣物');
+
+    await context.setOffline(true);
+    // 登记破损：没有照片时走「位置不便标记」路径（离线无法上传标记）
+    await page.getByRole('button', { name: '登记破损' }).click();
+    await page.getByRole('button', { name: '下一步：标位置' }).click();
+    await page.getByRole('checkbox', { name: '位置不便标记（例如已经送去店里）' }).check();
+    await page.getByPlaceholder('说明一下位置，例如：左袖口内侧，送修时被师傅带走了').fill('离线测试：左肘内侧');
+    await page.getByRole('button', { name: '下一步' }).click();
+    await page.getByLabel('描述').fill('断网时发现的小洞');
+    await page.getByRole('button', { name: '提交登记' }).click();
+
+    // 回到档案页，顶栏显示离线待同步
+    await expect(page).toHaveURL(new RegExp(`/garments/${garmentId}`, 'u'));
+    await expect(page.getByText(/离线待同步 1/u).first()).toBeVisible();
+
+    await context.setOffline(false);
+    // 自动同步成功：队列清空，并出现成功提示
+    await expect(page.getByText(/离线待同步/u)).toHaveCount(0, { timeout: 20_000 });
+    await expect(page.getByText(/离线记录已同步/u)).toBeVisible();
+
+    // 真的落库：档案页能看到破损记录
+    await page.reload();
+    await expect(page.getByText(/断网时发现的小洞|D\d{2}/u).first()).toBeVisible();
+  });
+
+  test('同步冲突：顶栏高亮并在同步中心说明合并结果', async ({ page }) => {
+    const email = uniqueEmail();
+    await register(page, email);
+    await createGarment(page, '冲突提示衣物');
+
+    const token = await page.evaluate(() => localStorage.getItem('gml.token') ?? '');
+
+    // 用 API 取衣物 / 字典，然后在线建一条破损，再把它改到 v2（模拟"别的端先改过"）
+    const { garmentId, damageId, stitchId } = await page.evaluate(async (authToken) => {
+      const headers = { authorization: `Bearer ${authToken}` };
+      const garments = await (await fetch('/api/garments?pageSize=1', { headers })).json();
+      const gid = garments.data.items[0].id as string;
+      const dict = await (await fetch('/api/dictionary', { headers })).json();
+      const created = await (
+        await fetch('/api/damage-events', {
+          method: 'POST',
+          headers: { ...headers, 'content-type': 'application/json' },
+          body: JSON.stringify({
+            garmentId: gid,
+            damageTypeId: dict.data.damageTypes.find((d: { code: string }) => d.code === 'hole').id,
+            severity: 'moderate',
+            detectedAt: new Date().toISOString().slice(0, 10),
+            annotationIds: [],
+            locationUnknown: true,
+            locationNote: '冲突测试：右肘',
+          }),
+        })
+      ).json();
+      const did = created.data.damage.id as string;
+      // 另一台设备先把严重度改成 severe → v2
+      await fetch(`/api/damage-events/${did}`, {
+        method: 'PATCH',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ severity: 'severe', expectedVersion: 1 }),
+      });
+      return { garmentId: gid, damageId: did, stitchId: dict.data.stitches[0].id as string };
+    }, token);
+
+    // 往本地塞一条基于 v1 的离线修补（模拟断网设备重连后同步）
+    await page.evaluate(
+      ({ id, stitchId: sid }) => {
+        const today = new Date().toISOString().slice(0, 10);
+        const queue = [
+          {
+            id: `op-conflict-${Date.now()}`,
+            kind: 'repair-create',
+            payload: {
+              damageEventId: id,
+              executedBy: 'self',
+              stitchId: sid,
+              stitchSecondaryIds: [],
+              startedAt: today,
+              finishedAt: today,
+              reuseOriginalFabric: false,
+            },
+            baseDamageVersion: 1,
+            summary: '冲突提示衣物 · 离线修补',
+            createdAt: Date.now(),
+            attempts: 0,
+          },
+        ];
+        localStorage.setItem('gml.offlineQueue.v2', JSON.stringify(queue));
+      },
+      { id: damageId, stitchId },
+    );
+
+    await page.goto(`/garments/${garmentId}`);
+    await expect(page.getByText(/离线待同步 1/u).first()).toBeVisible();
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+
+    // 冲突结果：顶栏出现"同步冲突"标签
+    await expect(page.getByText(/同步冲突 1/u).first()).toBeVisible({ timeout: 20_000 });
+
+    // 打开同步中心，能看到合并结果说明，并可跳到最新记录
+    await page.getByText(/同步冲突 1/u).first().click();
+    await expect(page.getByText('同步冲突：修补登记未按你的版本保存')).toBeVisible();
+    await expect(page.getByText(/服务端已经是 v2/u)).toBeVisible();
+    await page.getByRole('button', { name: '打开最新记录核对' }).click();
+    await expect(page).toHaveURL(/\/damage\//u);
   });
 });
