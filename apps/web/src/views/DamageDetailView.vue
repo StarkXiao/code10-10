@@ -3,11 +3,13 @@ import { computed, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import {
+  CAUSE_GUESSES,
   CAUSE_GUESS_LABEL,
   DAMAGE_STATUS_LABEL,
   DAMAGE_TERMINAL_STATUSES,
   DETECTED_SOURCE_LABEL,
   REPAIR_STATUS_LABEL,
+  SEVERITIES,
   SEVERITY_LABEL,
   VERDICT_LABEL,
   type CauseGuess,
@@ -17,10 +19,12 @@ import {
   type Severity,
   type Verdict,
 } from '@gml/shared';
-import { damageApi } from '../api';
+import { damageApi, wardrobeApi } from '../api';
 import { getToken, messageOf, photoFileUrl } from '../api/client';
 import EmptyState from '../components/EmptyState.vue';
-import type { DamageDetail } from '../types';
+import PartPicker from '../components/PartPicker.vue';
+import { useVersionedUpdate } from '../composables/useVersionedUpdate';
+import type { DamageDetail, DictionaryResponse } from '../types';
 
 const route = useRoute();
 const router = useRouter();
@@ -29,6 +33,21 @@ const data = ref<DamageDetail | null>(null);
 const candidates = ref<Array<{ id: string; code: string; detectedAt: string; damageType: string; part: string | null; lastStitch: string | null; daysSince: number }>>([]);
 const busy = ref(false);
 const scheduleDate = ref('');
+const dict = ref<DictionaryResponse | null>(null);
+const editOpen = ref(false);
+const editBusy = ref(false);
+const editBaseVersion = ref(1);
+const editForm = ref({
+  damageTypeId: '',
+  severity: 'moderate' as Severity,
+  partId: null as string | null,
+  detectedAt: '',
+  description: '',
+  causeGuess: null as CauseGuess | null,
+  lengthMm: undefined as number | undefined,
+  widthMm: undefined as number | undefined,
+});
+const { save: saveVersioned } = useVersionedUpdate();
 
 const damage = computed(() => data.value?.damage);
 const isOpen = computed(() => !!damage.value && !DAMAGE_TERMINAL_STATUSES.includes(damage.value.status as DamageStatus));
@@ -102,6 +121,60 @@ async function markUnrepairable(): Promise<void> {
 function openWorksheet(): void {
   window.open(`/api/print/repair-worksheet/${damageId}?token=${encodeURIComponent(getToken())}`, '_blank');
 }
+
+/** 打开编辑对话框：记下打开时的记录版本，保存时按它做乐观锁合并 */
+async function openEdit(): Promise<void> {
+  if (!damage.value) return;
+  try {
+    dict.value = dict.value ?? (await wardrobeApi.dictionary());
+  } catch (error) {
+    ElMessage.error(messageOf(error));
+    return;
+  }
+  editForm.value = {
+    damageTypeId: damage.value.damageType.id,
+    severity: damage.value.severity as Severity,
+    partId: damage.value.part?.id ?? null,
+    detectedAt: damage.value.detectedAt.slice(0, 10),
+    description: damage.value.description ?? '',
+    causeGuess: (damage.value.causeGuess as CauseGuess | null) ?? null,
+    lengthMm: damage.value.measurableSize?.lengthMm,
+    widthMm: damage.value.measurableSize?.widthMm,
+  };
+  editBaseVersion.value = damage.value.version;
+  editOpen.value = true;
+}
+
+async function saveEdit(): Promise<void> {
+  editBusy.value = true;
+  try {
+    const changes = {
+      damageTypeId: editForm.value.damageTypeId,
+      severity: editForm.value.severity,
+      partId: editForm.value.partId,
+      detectedAt: editForm.value.detectedAt,
+      description: editForm.value.description || null,
+      causeGuess: editForm.value.causeGuess,
+      measurableSize:
+        editForm.value.lengthMm !== undefined || editForm.value.widthMm !== undefined
+          ? { lengthMm: editForm.value.lengthMm ?? 0, widthMm: editForm.value.widthMm ?? 0 }
+          : null,
+    };
+    const outcome = await saveVersioned(
+      'damage-update',
+      damageId,
+      changes,
+      editBaseVersion.value,
+      `破损编辑 · ${damage.value?.code ?? ''}`,
+    );
+    if (outcome === 'failed') return;
+    editOpen.value = false;
+    // 离线入队/转冲突时本地没有新数据可刷新，只有真正落库才重新拉详情
+    if (outcome === 'saved') await load();
+  } finally {
+    editBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -123,6 +196,7 @@ function openWorksheet(): void {
         </div>
         <div style="display: flex; gap: 8px">
           <el-button size="small" @click="openWorksheet">打印修补工单</el-button>
+          <el-button size="small" :disabled="!isOpen" @click="openEdit">编辑</el-button>
           <el-button size="small" type="primary" :disabled="!isOpen" @click="router.push({ name: 'repair-new', params: { id: damageId } })">
             登记修补
           </el-button>
@@ -253,6 +327,50 @@ function openWorksheet(): void {
           </el-card>
         </el-col>
       </el-row>
+
+      <el-dialog v-model="editOpen" title="编辑破损记录" width="520px">
+        <el-alert
+          type="info"
+          :closable="false"
+          style="margin-bottom: 12px"
+          :title="`基于版本 ${editBaseVersion} 编辑；保存时若记录已被其他设备修改，会提示你对比合并`"
+        />
+        <el-form label-width="100px">
+          <el-form-item label="破损类型" required>
+            <el-select v-model="editForm.damageTypeId" style="width: 220px">
+              <el-option v-for="item in dict?.damageTypes ?? []" :key="item.id" :value="item.id" :label="item.name" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="严重度" required>
+            <el-radio-group v-model="editForm.severity">
+              <el-radio-button v-for="item in SEVERITIES" :key="item" :label="item">{{ SEVERITY_LABEL[item] }}</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="部位">
+            <PartPicker v-if="dict" v-model="editForm.partId" :parts="dict.partsFlat" />
+          </el-form-item>
+          <el-form-item label="发现日期" required>
+            <el-date-picker v-model="editForm.detectedAt" type="date" value-format="YYYY-MM-DD" style="width: 180px" />
+          </el-form-item>
+          <el-form-item label="描述">
+            <el-input v-model="editForm.description" type="textarea" :rows="3" maxlength="1000" />
+          </el-form-item>
+          <el-form-item label="原因猜测">
+            <el-select v-model="editForm.causeGuess" clearable style="width: 220px">
+              <el-option v-for="item in CAUSE_GUESSES" :key="item" :value="item" :label="CAUSE_GUESS_LABEL[item]" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="实测尺寸">
+            <el-input-number v-model="editForm.lengthMm" :min="0" :max="5000" placeholder="长(mm)" style="width: 140px" />
+            <span style="margin: 0 6px">×</span>
+            <el-input-number v-model="editForm.widthMm" :min="0" :max="5000" placeholder="宽(mm)" style="width: 140px" />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="editOpen = false">取消</el-button>
+          <el-button type="primary" :loading="editBusy" @click="saveEdit">保存</el-button>
+        </template>
+      </el-dialog>
     </template>
   </div>
 </template>

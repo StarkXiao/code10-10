@@ -68,7 +68,7 @@ try {
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_prisma%'",
   );
   if (Array.isArray(tables) && tables.length > 0) {
-    console.log(`[migrate] 数据库已有 ${tables.length} 张表，跳过建表（如需重建请先删除数据文件）`);
+    console.log(`[migrate] 数据库已有 ${tables.length} 张表，跳过建表`);
   } else {
     const statements = splitStatements(sql);
     for (const statement of statements) {
@@ -76,6 +76,29 @@ try {
     }
     console.log(`[migrate] 已执行 ${statements.length} 条建表语句`);
   }
+
+  // 既有数据库的增量升级（只加列/索引，不动数据，可反复执行）。
+  // 全量快照 migration.sql 只管新建库；老库靠这里逐列补齐。
+  const addedColumns = [
+    { table: 'damage_events', column: 'client_op_id', ddl: 'ALTER TABLE "damage_events" ADD COLUMN "client_op_id" TEXT' },
+    { table: 'damage_events', column: 'version', ddl: 'ALTER TABLE "damage_events" ADD COLUMN "version" INTEGER NOT NULL DEFAULT 1' },
+    { table: 'repairs', column: 'client_op_id', ddl: 'ALTER TABLE "repairs" ADD COLUMN "client_op_id" TEXT' },
+    { table: 'repairs', column: 'version', ddl: 'ALTER TABLE "repairs" ADD COLUMN "version" INTEGER NOT NULL DEFAULT 1' },
+  ];
+  for (const { table, column, ddl } of addedColumns) {
+    const columns = await prisma.$queryRawUnsafe(`PRAGMA table_info("${table}")`);
+    if (Array.isArray(columns) && columns.length > 0 && !columns.some((c) => c.name === column)) {
+      await prisma.$executeRawUnsafe(ddl);
+      console.log(`[migrate] 已为 ${table} 补充列 ${column}`);
+    }
+  }
+  for (const index of [
+    'CREATE UNIQUE INDEX IF NOT EXISTS "damage_events_client_op_id_key" ON "damage_events"("client_op_id")',
+    'CREATE UNIQUE INDEX IF NOT EXISTS "repairs_client_op_id_key" ON "repairs"("client_op_id")',
+  ]) {
+    await prisma.$executeRawUnsafe(index);
+  }
+
   const finalTables = await prisma.$queryRawUnsafe(
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_prisma%' ORDER BY name",
   );

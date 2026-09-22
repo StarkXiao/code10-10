@@ -69,7 +69,8 @@ async function logWear(): Promise<void> {
   } catch (error) {
     // 只有真正的网络故障才入队；参数非法之类的错误要如实报出来，否则会变成永远同步不成功的僵尸记录
     if (error instanceof ApiError && error.code === 'OFFLINE') {
-      offline.enqueue({ ...quick });
+      const name = garments.value.find((g) => g.id === quick.garmentId)?.name ?? '';
+      offline.enqueue('wear-log', { ...quick }, `穿着打点 · ${name}`);
       ElMessage.warning('当前网络不可用，已放入离线队列，联网后会自动同步');
     } else {
       ElMessage.error(messageOf(error));

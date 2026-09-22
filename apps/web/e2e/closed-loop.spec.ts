@@ -311,4 +311,46 @@ test.describe('衣物修补日志 · 主链路', () => {
     await expect(page.getByText('穿着次数').first()).toBeVisible();
     await expect(page.locator('body')).toContainText('1 次');
   });
+
+  test('断网登记破损与修补：先落本地，联网后幂等同步且不重复', async ({ page, context }) => {
+    await register(page, uniqueEmail());
+    await createGarment(page, '离线登记衣物');
+
+    // 在线时打开破损登记表单（表单数据加载完再断网）
+    await page.getByRole('button', { name: '登记破损' }).click();
+    await expect(page.getByText('登记破损').first()).toBeVisible();
+    await page.getByRole('button', { name: '下一步：标位置' }).click();
+    await page.getByText('位置不便标记').click();
+    await page.getByPlaceholder(/说明一下位置/u).fill('左袖口内侧，离线时登记');
+    await page.getByRole('button', { name: '下一步' }).click();
+    await page.getByLabel('描述').fill('袖口磨破，断网时先记下来');
+
+    // 断网提交：进入离线队列而不是报错
+    await context.setOffline(true);
+    await page.getByRole('button', { name: '提交登记' }).click();
+    await expect(page.getByText(/破损登记已放入离线队列/u)).toBeVisible();
+    await expect(page.getByText(/离线待同步 1/u)).toBeVisible();
+
+    // 联网后自动同步：队列清空，且真的落库（破损史出现 1 条）
+    await context.setOffline(false);
+    await expect(page.getByText(/离线待同步/u)).toHaveCount(0, { timeout: 20_000 });
+    await page.reload();
+    await expect(page.getByText('破损与修补史（1）')).toBeVisible();
+
+    // 在线打开修补表单，断网提交修补登记
+    await page.getByRole('button', { name: '详情' }).click();
+    await expect(page).toHaveURL(/\/damage\//u);
+    await page.getByRole('button', { name: '登记修补' }).click();
+    await expect(page.getByText('针法与执行')).toBeVisible();
+    await context.setOffline(true);
+    await page.getByRole('button', { name: '创建修补记录' }).click();
+    await expect(page.getByText(/修补登记已放入离线队列/u)).toBeVisible();
+    await expect(page.getByText(/离线待同步 1/u)).toBeVisible();
+
+    // 联网同步后：修补轮次真的落库，且重放不会建出第二轮
+    await context.setOffline(false);
+    await expect(page.getByText(/离线待同步/u)).toHaveCount(0, { timeout: 20_000 });
+    await page.reload();
+    await expect(page.getByText('修补轮次（1）')).toBeVisible();
+  });
 });

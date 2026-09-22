@@ -207,6 +207,8 @@ CREATE TABLE "damage_events" (
     "recurrence_index" INTEGER,
     "photos_snapshot" JSONB,
     "cancel_reason" TEXT,
+    "client_op_id" TEXT,
+    "version" INTEGER NOT NULL DEFAULT 1,
     "created_by" TEXT NOT NULL,
     "created_at" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" DATETIME NOT NULL,
@@ -238,6 +240,8 @@ CREATE TABLE "repairs" (
     "status" TEXT NOT NULL DEFAULT 'done',
     "reuse_original_fabric" BOOLEAN NOT NULL DEFAULT false,
     "note" TEXT,
+    "client_op_id" TEXT,
+    "version" INTEGER NOT NULL DEFAULT 1,
     "created_by" TEXT NOT NULL,
     "created_at" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" DATETIME NOT NULL,
@@ -490,6 +494,9 @@ CREATE UNIQUE INDEX "materials_code_key" ON "materials"("code");
 CREATE UNIQUE INDEX "care_rules_material_code_key" ON "care_rules"("material_code");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "damage_events_client_op_id_key" ON "damage_events"("client_op_id");
+
+-- CreateIndex
 CREATE INDEX "damage_events_garment_id_status_idx" ON "damage_events"("garment_id", "status");
 
 -- CreateIndex
@@ -500,6 +507,9 @@ CREATE INDEX "damage_events_recurrence_of_idx" ON "damage_events"("recurrence_of
 
 -- CreateIndex
 CREATE UNIQUE INDEX "damage_events_garment_id_code_key" ON "damage_events"("garment_id", "code");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "repairs_client_op_id_key" ON "repairs"("client_op_id");
 
 -- CreateIndex
 CREATE INDEX "repairs_status_observation_until_idx" ON "repairs"("status", "observation_until");

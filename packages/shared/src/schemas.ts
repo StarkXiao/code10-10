@@ -187,6 +187,8 @@ export const damageCreateSchema = z
     locationNote: z.string().max(200).nullable().optional(),
     scheduledAt: isoDate.nullable().optional(),
     recurrenceOfId: z.string().min(1).nullable().optional(),
+    /** 离线队列重放时的幂等键：同一次登记无论同步几次都只建一条 */
+    clientOpId: z.string().min(1).max(64).nullable().optional(),
   })
   .superRefine((value, ctx) => {
     if (!value.locationUnknown && value.annotationIds.length === 0) {
@@ -216,6 +218,11 @@ export const damageUpdateSchema = z.object({
     .object({ lengthMm: z.number().min(0).max(5000), widthMm: z.number().min(0).max(5000) })
     .nullable()
     .optional(),
+  /**
+   * 多端合并的乐观锁：填了就必须与服务器当前版本一致，否则 409 VERSION_CONFLICT；
+   * 不填则退化为最后写入胜出（兼容旧客户端）。
+   */
+  baseVersion: z.number().int().min(1).optional(),
 });
 
 export const damageScheduleSchema = z.object({
@@ -248,6 +255,8 @@ export const repairCreateSchema = z
     observationDays: z.number().int().min(1).max(365).nullable().optional(),
     reuseOriginalFabric: z.boolean().default(false),
     note: z.string().max(1000).nullable().optional(),
+    /** 离线队列重放时的幂等键：同一次登记无论同步几次都只建一条 */
+    clientOpId: z.string().min(1).max(64).nullable().optional(),
   })
   .superRefine((value, ctx) => {
     if (value.finishedAt < value.startedAt) {
@@ -269,6 +278,8 @@ export const repairUpdateSchema = z.object({
   resultRating: z.enum(RESULT_RATINGS).nullable().optional(),
   observationDays: z.number().int().min(1).max(365).nullable().optional(),
   note: z.string().max(1000).nullable().optional(),
+  /** 多端合并的乐观锁：与服务器版本不一致时返回 409 VERSION_CONFLICT */
+  baseVersion: z.number().int().min(1).optional(),
 });
 
 export const repairMaterialSchema = z.object({

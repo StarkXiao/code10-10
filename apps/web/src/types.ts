@@ -151,6 +151,7 @@ export interface RepairRow {
   id: string;
   damageEventId: string;
   round: number;
+  version: number;
   executedBy: string;
   shopName: string | null;
   cost: string | null;
@@ -188,6 +189,7 @@ export interface DamageRow {
   id: string;
   code: string;
   garmentId: string;
+  version: number;
   severity: 'minor' | 'moderate' | 'severe';
   status: DamageStatus;
   detectedAt: string;

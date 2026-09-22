@@ -8,12 +8,14 @@ import { getToken } from './api/client';
 import { useSessionStore } from './stores/session';
 import { useOfflineQueueStore } from './stores/offlineQueue';
 import { useOfflineSync } from './composables/useOfflineSync';
+import SyncConflicts from './components/SyncConflicts.vue';
 
 const route = useRoute();
 const router = useRouter();
 const session = useSessionStore();
 const offline = useOfflineQueueStore();
 const badge = ref(0);
+const conflictsOpen = ref(false);
 let source: EventSource | null = null;
 let badgeTimer: number | undefined;
 
@@ -27,7 +29,8 @@ const activeMenu = computed(() => {
   return '';
 });
 
-// 离线队列：断网时把穿着打点暂存到本地，恢复网络后按 clientOpId 幂等同步。
+// 离线队列：断网时把穿着打点、破损/修补登记与记录编辑先落本地，
+// 恢复网络后按 clientOpId 幂等同步；编辑按 baseVersion 乐观锁合并，冲突进冲突面板。
 // 必须在组件上下文里调用，否则 onMounted 不会执行（同步将永远不会启动）。
 useOfflineSync();
 
@@ -115,6 +118,15 @@ function logout(): void {
       <el-tag v-if="offline.queue.length > 0" type="warning" size="small">
         离线待同步 {{ offline.queue.length }}
       </el-tag>
+      <el-tag
+        v-if="offline.conflicts.length > 0"
+        type="danger"
+        size="small"
+        style="cursor: pointer"
+        @click="conflictsOpen = true"
+      >
+        同步冲突 {{ offline.conflicts.length }}
+      </el-tag>
       <el-dropdown v-if="session.user">
         <span style="cursor: pointer; display: inline-flex; align-items: center; gap: 2px">
           {{ session.user.displayName }}
@@ -131,5 +143,6 @@ function logout(): void {
     <el-main style="padding: 0">
       <router-view />
     </el-main>
+    <SyncConflicts v-model="conflictsOpen" />
   </el-container>
 </template>

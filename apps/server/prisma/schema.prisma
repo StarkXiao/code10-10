@@ -280,6 +280,9 @@ model DamageEvent {
   recurrenceIndex Int?      @map("recurrence_index")
   photosSnapshot  Json?     @map("photos_snapshot")
   cancelReason    String?   @map("cancel_reason")
+  // 离线同步与多端合并：clientOpId 保证断网重放幂等；version 乐观锁，编辑以 baseVersion 合并
+  clientOpId      String?   @unique @map("client_op_id")
+  version         Int       @default(1)
   createdBy       String    @map("created_by")
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
@@ -320,6 +323,9 @@ model Repair {
   status               String    @default("done")
   reuseOriginalFabric  Boolean   @default(false) @map("reuse_original_fabric")
   note                 String?
+  // 离线同步与多端合并：clientOpId 保证断网重放幂等；version 乐观锁，编辑以 baseVersion 合并
+  clientOpId           String?   @unique @map("client_op_id")
+  version              Int       @default(1)
   createdBy            String    @map("created_by")
   createdAt            DateTime  @default(now()) @map("created_at")
   updatedAt            DateTime  @updatedAt @map("updated_at")

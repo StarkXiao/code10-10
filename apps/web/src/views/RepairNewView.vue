@@ -26,13 +26,15 @@ import {
   type Visibility,
 } from '@gml/shared';
 import { damageApi, fabricApi, photoApi, repairApi, wardrobeApi } from '../api';
-import { messageOf } from '../api/client';
+import { ApiError, messageOf } from '../api/client';
+import { useOfflineQueueStore } from '../stores/offlineQueue';
 import PhotoUploader from '../components/PhotoUploader.vue';
 import type { DamageDetail, DictionaryResponse, FabricSourceItem, GarmentPhotoRow } from '../types';
 
 const route = useRoute();
 const router = useRouter();
 const queryClient = useQueryClient();
+const offline = useOfflineQueueStore();
 const damageId = String(route.params.id);
 
 const step = ref(0);
@@ -100,31 +102,41 @@ onMounted(async () => {
 
 async function createRepair(): Promise<void> {
   if (!damage.value) return;
+  const payload = {
+    damageEventId: damageId,
+    executedBy: form.value.executedBy,
+    shopName: form.value.shopName || null,
+    shopCost: form.value.shopCost ?? null,
+    stitchId: form.value.stitchId,
+    stitchSecondaryIds: form.value.secondaryIds,
+    threadType: form.value.threadType || null,
+    threadColor: form.value.threadColor || null,
+    durationMinutes: form.value.durationMinutes ?? null,
+    cost: form.value.cost ?? null,
+    startedAt: form.value.startedAt,
+    finishedAt: form.value.finishedAt,
+    resultRating: form.value.resultRating,
+    observationDays: form.value.observationDays ?? null,
+    reuseOriginalFabric: form.value.reuseOriginalFabric,
+    note: form.value.note || null,
+  };
   busy.value = true;
   try {
-    const data = await repairApi.create({
-      damageEventId: damageId,
-      executedBy: form.value.executedBy,
-      shopName: form.value.shopName || null,
-      shopCost: form.value.shopCost ?? null,
-      stitchId: form.value.stitchId,
-      stitchSecondaryIds: form.value.secondaryIds,
-      threadType: form.value.threadType || null,
-      threadColor: form.value.threadColor || null,
-      durationMinutes: form.value.durationMinutes ?? null,
-      cost: form.value.cost ?? null,
-      startedAt: form.value.startedAt,
-      finishedAt: form.value.finishedAt,
-      resultRating: form.value.resultRating,
-      observationDays: form.value.observationDays ?? null,
-      reuseOriginalFabric: form.value.reuseOriginalFabric,
-      note: form.value.note || null,
-    });
+    const data = await repairApi.create(payload);
     repairId.value = data.repair.id;
     ElMessage.success(`已登记第 ${data.repair.round} 轮修补`);
     step.value = 1;
   } catch (error) {
-    ElMessage.error(messageOf(error));
+    // 断网：修补登记原样进离线队列，联网后按 clientOpId 幂等同步（不会建出重复轮次）。
+    // 用料扣减与「修补后变化」依赖服务端已存在的修补记录，只能等同步完成后再补。
+    if (error instanceof ApiError && error.code === 'OFFLINE') {
+      const stitchName = dict.value?.stitches.find((s) => s.id === form.value.stitchId)?.name ?? '';
+      offline.enqueue('repair-create', { ...payload }, `修补登记 · ${damage.value?.garment.name ?? ''} ${damage.value?.code ?? ''}（${stitchName}）`);
+      ElMessage.warning('当前网络不可用，修补登记已放入离线队列；联网同步后请再到这条破损下补录用料与修补后变化');
+      await router.push({ name: 'damage-detail', params: { id: damageId } });
+    } else {
+      ElMessage.error(messageOf(error));
+    }
   } finally {
     busy.value = false;
   }

@@ -14,7 +14,8 @@ import { created, handler, ok, parseBody, parseQuery } from '../lib/http.js';
 import { prisma } from '../lib/prisma.js';
 import { logActivity } from '../lib/activity.js';
 import { nextDamageCode } from '../lib/ids.js';
-import { withUniqueRetry } from '../lib/prisma-errors.js';
+import { isUniqueViolation, withUniqueRetry } from '../lib/prisma-errors.js';
+import { versionConflict } from '../lib/versioned.js';
 import { addDays, parseDateOnly } from '../lib/date.js';
 import { requireAuth } from '../middleware/auth.js';
 import { syncGarmentStatus } from '../services/stats.js';
@@ -94,6 +95,16 @@ damageRouter.post(
   '/',
   handler(async (req, res) => {
     const body = parseBody(damageCreateSchema, req.body);
+
+    // 离线队列重放的幂等出口：同一个 clientOpId 无论同步几次，都只对应一条破损事件
+    if (body.clientOpId) {
+      const replayed = await findDamageByOpId(body.clientOpId, req.ctx.wardrobeId);
+      if (replayed) {
+        ok(req, res, { damage: replayed, idempotent: true }, { idempotent: true });
+        return;
+      }
+    }
+
     const garment = await prisma.garment.findFirst({
       where: { id: body.garmentId, wardrobeId: req.ctx.wardrobeId, deletedAt: null },
     });
@@ -134,41 +145,56 @@ damageRouter.post(
     }));
 
     // 破损编号同样是「查数量 +1」，并发登记会撞车 → 撞了就重算
-    const damage = await withUniqueRetry(async () => {
-      const code = await nextDamageCode(garment.id, garment.code);
-      return prisma.$transaction(async (tx) => {
-        const record = await tx.damageEvent.create({
-          data: {
-            garmentId: garment.id,
-            code,
-            damageTypeId: body.damageTypeId,
-            severity: body.severity,
-            partId: body.partId ?? null,
-            detectedAt: parseDateOnly(body.detectedAt),
-            detectedSource: body.detectedSource,
-            description: body.description ?? null,
-            causeGuess: body.causeGuess ?? null,
-            measurableSize: (body.measurableSize ?? undefined) as never,
-            status: body.scheduledAt ? 'scheduled' : 'pending',
-            scheduledAt: body.scheduledAt ? parseDateOnly(body.scheduledAt) : null,
-            locationUnknown: body.locationUnknown,
-            locationNote: body.locationNote ?? null,
-            recurrenceOf: body.recurrenceOfId ?? null,
-            recurrenceIndex,
-            photosSnapshot: photoSnapshot as never,
-            createdBy: req.ctx.userId,
-          },
-        });
-        // 标记 → 破损事件，并冻结为证据（后续被改动也不影响当时的记录）
-        if (annotations.length > 0) {
-          await tx.photoAnnotation.updateMany({
-            where: { id: { in: annotations.map((a) => a.id) } },
-            data: { damageEventId: record.id, status: 'linked', frozen: true },
+    let damage;
+    try {
+      damage = await withUniqueRetry(async () => {
+        const code = await nextDamageCode(garment.id, garment.code);
+        return prisma.$transaction(async (tx) => {
+          const record = await tx.damageEvent.create({
+            data: {
+              garmentId: garment.id,
+              code,
+              damageTypeId: body.damageTypeId,
+              severity: body.severity,
+              partId: body.partId ?? null,
+              detectedAt: parseDateOnly(body.detectedAt),
+              detectedSource: body.detectedSource,
+              description: body.description ?? null,
+              causeGuess: body.causeGuess ?? null,
+              measurableSize: (body.measurableSize ?? undefined) as never,
+              status: body.scheduledAt ? 'scheduled' : 'pending',
+              scheduledAt: body.scheduledAt ? parseDateOnly(body.scheduledAt) : null,
+              locationUnknown: body.locationUnknown,
+              locationNote: body.locationNote ?? null,
+              recurrenceOf: body.recurrenceOfId ?? null,
+              recurrenceIndex,
+              photosSnapshot: photoSnapshot as never,
+              clientOpId: body.clientOpId ?? null,
+              createdBy: req.ctx.userId,
+            },
           });
-        }
-        return record;
+          // 标记 → 破损事件，并冻结为证据（后续被改动也不影响当时的记录）
+          if (annotations.length > 0) {
+            await tx.photoAnnotation.updateMany({
+              where: { id: { in: annotations.map((a) => a.id) } },
+              data: { damageEventId: record.id, status: 'linked', frozen: true },
+            });
+          }
+          return record;
+        });
       });
-    });
+    } catch (error) {
+      // 同一条离线记录被并发重放（两个标签页同时恢复网络）：
+      // client_op_id 唯一约束拦住重复插入，返回已建好的那条即是幂等成功
+      if (body.clientOpId && isUniqueViolation(error)) {
+        const replayed = await findDamageByOpId(body.clientOpId, req.ctx.wardrobeId);
+        if (replayed) {
+          ok(req, res, { damage: replayed, idempotent: true }, { idempotent: true });
+          return;
+        }
+      }
+      throw error;
+    }
 
     await syncGarmentStatus(garment.id);
 
@@ -262,18 +288,34 @@ damageRouter.patch(
       throw new HttpError('DAMAGE_ALREADY_RESOLVED', '这个破损事件已经终结，只能追加备注，不能修改关键信息');
     }
     const body = parseBody(damageUpdateSchema, req.body);
-    const updated = await prisma.damageEvent.update({
-      where: { id: damage.id },
-      data: {
-        ...(body.damageTypeId ? { damageTypeId: body.damageTypeId } : {}),
-        ...(body.severity ? { severity: body.severity } : {}),
-        ...(body.partId !== undefined ? { partId: body.partId } : {}),
-        ...(body.detectedAt ? { detectedAt: parseDateOnly(body.detectedAt) } : {}),
-        ...(body.description !== undefined ? { description: body.description } : {}),
-        ...(body.causeGuess !== undefined ? { causeGuess: body.causeGuess } : {}),
-        ...(body.measurableSize !== undefined ? { measurableSize: body.measurableSize as never } : {}),
-      },
-    });
+    const fields = {
+      ...(body.damageTypeId ? { damageTypeId: body.damageTypeId } : {}),
+      ...(body.severity ? { severity: body.severity } : {}),
+      ...(body.partId !== undefined ? { partId: body.partId } : {}),
+      ...(body.detectedAt ? { detectedAt: parseDateOnly(body.detectedAt) } : {}),
+      ...(body.description !== undefined ? { description: body.description } : {}),
+      ...(body.causeGuess !== undefined ? { causeGuess: body.causeGuess } : {}),
+      ...(body.measurableSize !== undefined ? { measurableSize: body.measurableSize as never } : {}),
+    };
+    let updated;
+    if (body.baseVersion !== undefined) {
+      // 多端合并：只有记录仍停留在客户端编辑时的版本才落库（同时版本 +1）；
+      // 否则说明期间被别的端改过，返回 409 与服务器当前记录，让用户决定保留哪一版
+      const merged = await prisma.damageEvent.updateMany({
+        where: { id: damage.id, version: body.baseVersion },
+        // updateMany 不触发 @updatedAt，显式带上
+        data: { ...fields, version: { increment: 1 }, updatedAt: new Date() },
+      });
+      if (merged.count === 0) {
+        throw versionConflict(await prisma.damageEvent.findUniqueOrThrow({ where: { id: damage.id } }));
+      }
+      updated = await prisma.damageEvent.findUniqueOrThrow({ where: { id: damage.id } });
+    } else {
+      updated = await prisma.damageEvent.update({
+        where: { id: damage.id },
+        data: { ...fields, version: { increment: 1 } },
+      });
+    }
     await logActivity({
       wardrobeId: req.ctx.wardrobeId,
       actorId: req.ctx.userId,
@@ -295,7 +337,7 @@ damageRouter.post(
     const scheduledAt = parseDateOnly(body.scheduledAt);
     const updated = await prisma.damageEvent.update({
       where: { id: damage.id },
-      data: { scheduledAt, status: damage.status === 'pending' ? 'scheduled' : damage.status },
+      data: { scheduledAt, status: damage.status === 'pending' ? 'scheduled' : damage.status, version: { increment: 1 } },
     });
     await createReminderIfAbsent({
       wardrobeId: req.ctx.wardrobeId,
@@ -323,7 +365,7 @@ damageRouter.post(
     const body = parseBody(z.object({ reason: z.string().min(1).max(300) }), req.body);
     const updated = await prisma.damageEvent.update({
       where: { id: damage.id },
-      data: { status: 'unrepairable', resolvedAt: new Date(), cancelReason: body.reason },
+      data: { status: 'unrepairable', resolvedAt: new Date(), cancelReason: body.reason, version: { increment: 1 } },
     });
     await closeRemindersForDamage(damage.id, { unrepairable: true, reason: body.reason });
     const garmentStatus = await syncGarmentStatus(damage.garmentId);
@@ -338,7 +380,7 @@ damageRouter.post(
     const body = parseBody(damageCancelSchema, req.body);
     const updated = await prisma.damageEvent.update({
       where: { id: damage.id },
-      data: { status: 'cancelled', resolvedAt: new Date(), cancelReason: body.reason },
+      data: { status: 'cancelled', resolvedAt: new Date(), cancelReason: body.reason, version: { increment: 1 } },
     });
     await closeRemindersForDamage(damage.id, { cancelled: true, reason: body.reason });
     const garmentStatus = await syncGarmentStatus(damage.garmentId);
@@ -390,7 +432,7 @@ damageRouter.post(
     if (!original) throw new HttpError('NOT_FOUND', '原始破损事件不存在');
     const updated = await prisma.damageEvent.update({
       where: { id: damage.id },
-      data: { recurrenceOf: original.id, recurrenceIndex: (original.recurrenceIndex ?? 1) + 1 },
+      data: { recurrenceOf: original.id, recurrenceIndex: (original.recurrenceIndex ?? 1) + 1, version: { increment: 1 } },
     });
     await logActivity({
       wardrobeId: req.ctx.wardrobeId,
@@ -425,6 +467,13 @@ async function findDamageOrThrow(id: string, wardrobeId: string) {
   });
   if (!damage) throw new HttpError('NOT_FOUND', '破损事件不存在');
   return damage;
+}
+
+/** 按离线幂等键找记录（限定在当前衣橱内，避免跨衣橱串号） */
+async function findDamageByOpId(clientOpId: string, wardrobeId: string) {
+  return prisma.damageEvent.findFirst({
+    where: { clientOpId, garment: { wardrobeId, deletedAt: null } },
+  });
 }
 
 async function closeRemindersForDamage(damageId: string, resultRef: Record<string, unknown>) {

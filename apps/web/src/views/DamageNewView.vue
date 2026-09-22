@@ -15,7 +15,8 @@ import {
   type Severity,
 } from '@gml/shared';
 import { damageApi, garmentApi, photoApi, wardrobeApi } from '../api';
-import { messageOf } from '../api/client';
+import { ApiError, messageOf } from '../api/client';
+import { useOfflineQueueStore } from '../stores/offlineQueue';
 import PartPicker from '../components/PartPicker.vue';
 import PhotoAnnotator, { type DraftAnnotation } from '../components/PhotoAnnotator.vue';
 import type { DictionaryResponse, GarmentDetailResponse, PhotoAnnotationRow } from '../types';
@@ -23,6 +24,7 @@ import type { DictionaryResponse, GarmentDetailResponse, PhotoAnnotationRow } fr
 const route = useRoute();
 const router = useRouter();
 const queryClient = useQueryClient();
+const offline = useOfflineQueueStore();
 const garmentId = String(route.params.id);
 
 const step = ref(0);
@@ -120,6 +122,30 @@ async function submit(): Promise<void> {
     ElMessage.warning('选择「位置不便标记」时必须写明原因');
     return;
   }
+  // 断网时照片标记没法先存到服务器（标记挂在服务端照片上），
+  // 只有「无需新标记」的登记才能离线入队，否则让用户联网后再提交
+  if (!navigator.onLine && drafts.value.length > 0) {
+    ElMessage.warning('当前离线：照片上的新标记需要联网才能保存。请联网后提交，或勾选「位置不便标记」先离线登记。');
+    return;
+  }
+  const payload = {
+    garmentId,
+    damageTypeId: form.value.damageTypeId,
+    severity: form.value.severity,
+    partId: form.value.partId,
+    detectedAt: form.value.detectedAt,
+    detectedSource: form.value.detectedSource,
+    description: form.value.description || null,
+    causeGuess: form.value.causeGuess,
+    measurableSize:
+      form.value.lengthMm !== undefined || form.value.widthMm !== undefined
+        ? { lengthMm: form.value.lengthMm ?? 0, widthMm: form.value.widthMm ?? 0 }
+        : null,
+    annotationIds: savedAnnotationIds.value,
+    locationUnknown: form.value.locationUnknown,
+    locationNote: form.value.locationNote || null,
+    scheduledAt: form.value.scheduledAt || null,
+  };
   busy.value = true;
   try {
     if (drafts.value.length > 0 && photoId.value) {
@@ -136,24 +162,7 @@ async function submit(): Promise<void> {
       drafts.value = [];
     }
 
-    const data = await damageApi.create({
-      garmentId,
-      damageTypeId: form.value.damageTypeId,
-      severity: form.value.severity,
-      partId: form.value.partId,
-      detectedAt: form.value.detectedAt,
-      detectedSource: form.value.detectedSource,
-      description: form.value.description || null,
-      causeGuess: form.value.causeGuess,
-      measurableSize:
-        form.value.lengthMm !== undefined || form.value.widthMm !== undefined
-          ? { lengthMm: form.value.lengthMm ?? 0, widthMm: form.value.widthMm ?? 0 }
-          : null,
-      annotationIds: savedAnnotationIds.value,
-      locationUnknown: form.value.locationUnknown,
-      locationNote: form.value.locationNote || null,
-      scheduledAt: form.value.scheduledAt || null,
-    });
+    const data = await damageApi.create(payload);
 
     ElMessage.success(`已登记 ${data.damage.code}`);
     await Promise.all([
@@ -163,7 +172,21 @@ async function submit(): Promise<void> {
     ]);
     await router.push({ name: 'damage-detail', params: { id: data.damage.id } });
   } catch (error) {
-    ElMessage.error(messageOf(error));
+    // 断网：登记内容原样进离线队列，联网后按 clientOpId 幂等同步（不会建出重复破损）
+    if (error instanceof ApiError && error.code === 'OFFLINE') {
+      // 还有没存上服务器的照片标记时不能入队——标记挂在服务端照片上，
+      // 离线队列只存表单数据，硬入队会把用户画好的标记悄悄丢掉
+      if (drafts.value.length > 0) {
+        ElMessage.error('网络中断时照片上的新标记还没保存成功，请联网后重新提交（已画好的标记还在）');
+        return;
+      }
+      const typeName = dict.value?.damageTypes.find((d) => d.id === form.value.damageTypeId)?.name ?? '';
+      offline.enqueue('damage-create', { ...payload }, `破损登记 · ${detail.value?.garment.name ?? ''} ${typeName}`);
+      ElMessage.warning('当前网络不可用，破损登记已放入离线队列，联网后会自动同步');
+      await router.push({ name: 'garment-detail', params: { id: garmentId } });
+    } else {
+      ElMessage.error(messageOf(error));
+    }
   } finally {
     busy.value = false;
   }

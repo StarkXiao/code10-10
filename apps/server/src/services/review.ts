@@ -93,14 +93,14 @@ export async function performReview(params: {
     damageStatus = 'resolved';
     await prisma.damageEvent.update({
       where: { id: repair.damageEventId },
-      data: { status: 'resolved', resolvedAt: new Date() },
+      data: { status: 'resolved', resolvedAt: new Date(), version: { increment: 1 } },
     });
   } else if (params.input.nextAction === 'monitor') {
     repairStatus = 'observing';
     damageStatus = 'observing';
     await prisma.damageEvent.update({
       where: { id: repair.damageEventId },
-      data: { status: 'observing' },
+      data: { status: 'observing', version: { increment: 1 } },
     });
     const dueAt = addDays(reviewedAt, 30);
     const created = await createReminderIfAbsent({
@@ -125,7 +125,7 @@ export async function performReview(params: {
     damageStatus = 'pending';
     await prisma.damageEvent.update({
       where: { id: repair.damageEventId },
-      data: { status: 'pending', resolvedAt: null },
+      data: { status: 'pending', resolvedAt: null, version: { increment: 1 } },
     });
     const dueAt = new Date(reviewedAt);
     const created = await createReminderIfAbsent({
@@ -151,7 +151,7 @@ export async function performReview(params: {
     damageStatus = 'unrepairable';
     await prisma.damageEvent.update({
       where: { id: repair.damageEventId },
-      data: { status: 'unrepairable', resolvedAt: new Date() },
+      data: { status: 'unrepairable', resolvedAt: new Date(), version: { increment: 1 } },
     });
     const dueAt = new Date(reviewedAt);
     const created = await createReminderIfAbsent({
@@ -174,7 +174,7 @@ export async function performReview(params: {
     if (created.created && created.reminderId) reminderCreated = { kind: 'retire', id: created.reminderId };
   }
 
-  await prisma.repair.update({ where: { id: repair.id }, data: { status: repairStatus } });
+  await prisma.repair.update({ where: { id: repair.id }, data: { status: repairStatus, version: { increment: 1 } } });
 
   // 复检提交后，这条修补相关的待办全部闭环（带结果引用，不能"假完成"）
   await closeRemindersFor('repair', repair.id, { reviewId: review.id, verdict: params.input.verdict });

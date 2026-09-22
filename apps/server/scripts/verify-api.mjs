@@ -296,10 +296,27 @@ await call(`/damage-events/${damage.id}/schedule`, {
   body: { scheduledAt: daysAgo(-3) },
   note: '排期修补',
 });
+// 版本合并：先读当前版本，再按 baseVersion 更新；过期版本必须 409
+const damageNow = await call(`/damage-events/${damage.id}`, { note: '读取破损当前版本' });
+await call(`/damage-events/${damage.id}`, {
+  method: 'PATCH',
+  body: { description: '接口扫描更新描述', baseVersion: damageNow.damage.version },
+  note: '按版本合并更新破损',
+});
+const staleDamage = await fetch(`${BASE}/api/damage-events/${damage.id}`, {
+  method: 'PATCH',
+  headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+  body: JSON.stringify({ description: '过期版本的修改', baseVersion: 1 }),
+});
+const staleDamageJson = await staleDamage.json();
+staleDamage.status === 409 && staleDamageJson?.error?.code === 'VERSION_CONFLICT'
+  ? passed.push('PATCH /damage-events/:id (过期版本) → 409 VERSION_CONFLICT')
+  : failures.push({ endpoint: 'PATCH /damage-events/:id (过期版本)', status: staleDamage.status, expected: 409 });
+const repairNow = await call(`/repairs/${repair.id}`, { note: '读取修补当前版本' });
 await call(`/repairs/${repair.id}`, {
   method: 'PATCH',
-  body: { note: '接口扫描更新修补备注' },
-  note: '更新修补',
+  body: { note: '接口扫描更新修补备注', baseVersion: repairNow.repair.version },
+  note: '按版本合并更新修补',
 });
 await call(`/annotations/${annotation.id}`, {
   method: 'PATCH',

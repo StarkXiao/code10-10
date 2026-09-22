@@ -6,6 +6,7 @@ import {
   DRAPE_CHANGE_LABEL,
   EXECUTED_BY_LABEL,
   REPAIR_STATUS_LABEL,
+  RESULT_RATINGS,
   RESULT_RATING_LABEL,
   STIFFNESS_LABEL,
   VERDICT_LABEL,
@@ -20,11 +21,12 @@ import {
   type Visibility,
   type ColorMatch,
 } from '@gml/shared';
-import { repairApi } from '../api';
+import { repairApi, wardrobeApi } from '../api';
 import { getToken, messageOf } from '../api/client';
 import BeforeAfterSlider from '../components/BeforeAfterSlider.vue';
 import EmptyState from '../components/EmptyState.vue';
-import type { RepairDetail } from '../types';
+import { useVersionedUpdate } from '../composables/useVersionedUpdate';
+import type { DictionaryResponse, RepairDetail } from '../types';
 
 const route = useRoute();
 const router = useRouter();
@@ -33,6 +35,21 @@ const data = ref<RepairDetail | null>(null);
 const comparison = ref<Record<string, unknown> | null>(null);
 const busy = ref(false);
 const extraDays = ref<number | undefined>();
+const dict = ref<DictionaryResponse | null>(null);
+const editOpen = ref(false);
+const editBusy = ref(false);
+const editBaseVersion = ref(1);
+const editForm = ref({
+  stitchId: '',
+  threadType: '',
+  threadColor: '',
+  durationMinutes: undefined as number | undefined,
+  cost: undefined as number | undefined,
+  resultRating: null as ResultRating | null,
+  observationDays: undefined as number | undefined,
+  note: '',
+});
+const { save: saveVersioned } = useVersionedUpdate();
 
 const repair = computed(() => data.value?.repair);
 const change = computed(() => repair.value?.change ?? null);
@@ -68,6 +85,58 @@ async function startObservation(): Promise<void> {
 function openWorksheet(): void {
   window.open(`/api/print/repair-worksheet/${repair.value?.damageEventId}?token=${encodeURIComponent(getToken())}`, '_blank');
 }
+
+/** 打开编辑对话框：记下打开时的记录版本，保存时按它做乐观锁合并 */
+async function openEdit(): Promise<void> {
+  if (!repair.value) return;
+  try {
+    dict.value = dict.value ?? (await wardrobeApi.dictionary());
+  } catch (error) {
+    ElMessage.error(messageOf(error));
+    return;
+  }
+  editForm.value = {
+    stitchId: repair.value.stitch.id,
+    threadType: repair.value.threadType ?? '',
+    threadColor: repair.value.threadColor ?? '',
+    durationMinutes: repair.value.durationMinutes ?? undefined,
+    cost: repair.value.cost !== null ? Number(repair.value.cost) : undefined,
+    resultRating: (repair.value.resultRating as ResultRating | null) ?? null,
+    observationDays: repair.value.observationDays,
+    note: repair.value.note ?? '',
+  };
+  editBaseVersion.value = repair.value.version;
+  editOpen.value = true;
+}
+
+async function saveEdit(): Promise<void> {
+  editBusy.value = true;
+  try {
+    const changes = {
+      stitchId: editForm.value.stitchId,
+      threadType: editForm.value.threadType || null,
+      threadColor: editForm.value.threadColor || null,
+      durationMinutes: editForm.value.durationMinutes ?? null,
+      cost: editForm.value.cost ?? null,
+      resultRating: editForm.value.resultRating,
+      observationDays: editForm.value.observationDays ?? null,
+      note: editForm.value.note || null,
+    };
+    const outcome = await saveVersioned(
+      'repair-update',
+      repairId,
+      changes,
+      editBaseVersion.value,
+      `修补编辑 · ${repair.value?.damageEvent.code ?? ''} 第 ${repair.value?.round ?? ''} 轮`,
+    );
+    if (outcome === 'failed') return;
+    editOpen.value = false;
+    // 离线入队/转冲突时本地没有新数据可刷新，只有真正落库才重新拉详情
+    if (outcome === 'saved') await load();
+  } finally {
+    editBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -89,6 +158,13 @@ function openWorksheet(): void {
         <div style="display: flex; gap: 8px">
           <el-button size="small" @click="openWorksheet">打印工单</el-button>
           <el-button size="small" @click="router.push({ name: 'damage-detail', params: { id: repair.damageEventId } })">破损详情</el-button>
+          <el-button
+            v-if="repair.status !== 'passed' && repair.status !== 'superseded'"
+            size="small"
+            @click="openEdit"
+          >
+            编辑
+          </el-button>
           <el-button
             v-if="repair.status !== 'passed' && repair.status !== 'superseded'"
             size="small"
@@ -216,6 +292,45 @@ function openWorksheet(): void {
           </el-card>
         </el-col>
       </el-row>
+
+      <el-dialog v-model="editOpen" title="编辑修补记录" width="520px">
+        <el-alert
+          type="info"
+          :closable="false"
+          style="margin-bottom: 12px"
+          :title="`基于版本 ${editBaseVersion} 编辑；保存时若记录已被其他设备修改，会提示你对比合并`"
+        />
+        <el-form label-width="100px">
+          <el-form-item label="针法" required>
+            <el-select v-model="editForm.stitchId" style="width: 260px">
+              <el-option v-for="item in dict?.stitches ?? []" :key="item.id" :value="item.id" :label="item.name" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="线材 / 线色">
+            <el-input v-model="editForm.threadType" placeholder="羊毛线" style="width: 180px" />
+            <el-input v-model="editForm.threadColor" placeholder="深灰" style="width: 160px; margin-left: 8px" />
+          </el-form-item>
+          <el-form-item label="耗时 / 花费">
+            <el-input-number v-model="editForm.durationMinutes" :min="0" :max="10000" placeholder="分钟" style="width: 140px" />
+            <el-input-number v-model="editForm.cost" :min="0" :precision="2" placeholder="元" style="width: 150px; margin-left: 8px" />
+          </el-form-item>
+          <el-form-item label="满意度">
+            <el-radio-group v-model="editForm.resultRating">
+              <el-radio-button v-for="item in RESULT_RATINGS" :key="item" :label="item">{{ RESULT_RATING_LABEL[item] }}</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="观察期天数">
+            <el-input-number v-model="editForm.observationDays" :min="1" :max="365" style="width: 160px" />
+          </el-form-item>
+          <el-form-item label="备注">
+            <el-input v-model="editForm.note" type="textarea" :rows="2" maxlength="1000" />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="editOpen = false">取消</el-button>
+          <el-button type="primary" :loading="editBusy" @click="saveEdit">保存</el-button>
+        </template>
+      </el-dialog>
     </template>
   </div>
 </template>
